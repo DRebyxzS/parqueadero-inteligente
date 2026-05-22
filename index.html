@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sistema Parqueadero Inteligente</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@latest/dist/teachablemachine-image.min.js"></script>
+
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f6f9;
+            margin: 0;
+            padding: 20px;
+            color: #333;
+        }
+        h1, h2 { text-align: center; color: #2c3e50; }
+        .seccion-camara {
+            background: white; padding: 20px; border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; margin-bottom: 30px;
+        }
+        #camara-canvas {
+            width: 100%; max-width: 400px; border-radius: 8px; border: 2px solid #34495e;
+        }
+        #resultado-prediccion { font-size: 24px; font-weight: bold; margin: 15px 0; color: #2980b9; }
+        button {
+            padding: 10px 20px; font-size: 16px; margin: 5px; border: none;
+            border-radius: 5px; cursor: pointer; color: white; transition: opacity 0.3s;
+        }
+        button:hover { opacity: 0.8; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; } /* Nuevo: Estilo botón deshabilitado */
+        .btn-entrada { background-color: #27ae60; }
+        .btn-salida { background-color: #c0392b; }
+        .seccion-parqueaderos { margin-bottom: 30px; }
+        .cuadricula-parqueaderos {
+            display: grid; grid-template-columns: repeat(4, 1fr);
+            gap: 15px; max-width: 800px; margin: 0 auto;
+        }
+        .cajon {
+            background-color: #2ecc71; color: white; padding: 20px; border-radius: 8px;
+            text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); transition: background-color 0.5s;
+        }
+        .cajon h3 { margin: 0 0 10px 0; font-size: 20px; }
+        .cajon p { margin: 5px 0; font-size: 14px; }
+        .ocupado { background-color: #e74c3c; }
+        .seccion-historial {
+            background: white; padding: 20px; border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1); overflow-x: auto;
+        }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #34495e; color: white; }
+        .no-registrado { background-color: #ffe0e0; }
+    </style>
+</head>
+<body>
+
+    <h1>🚗 Sistema Parqueadero Inteligente</h1>
+
+    <div class="seccion-camara">
+        <div><canvas id="camara-canvas"></canvas></div>
+        <div id="resultado-prediccion">Esperando cámara...</div>
+        <div>
+            <button class="btn-entrada" id="btn-entrada">🟢 Registrar Entrada</button>
+            <button class="btn-salida" id="btn-salida">🔴 Registrar Salida</button>
+        </div>
+    </div>
+
+    <div class="seccion-parqueaderos">
+        <h2>Estado del Parqueadero (<span id="espacios-disponibles">8</span>/8 disponibles)</h2>
+        <div class="cuadricula-parqueaderos" id="cuadricula"></div>
+    </div>
+
+    <div class="seccion-historial">
+        <h2>Historial de Registros</h2>
+        <table id="tabla-historial">
+            <thead>
+                <tr>
+                    <th>Placa</th>
+                    <th>Estado</th>
+                    <th>Espacio</th>
+                    <th>Hora Entrada</th>
+                    <th>Hora Salida</th>
+                </tr>
+            </thead>
+            <tbody id="cuerpo-historial"></tbody>
+        </table>
+    </div>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/12.13.0/firebase-app.js";
+        import { getDatabase, ref, set, get, onValue, push } from "https://www.gstatic.com/firebasejs/12.13.0/firebase-database.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyA7iDnH7uVs9ouVjzwAqezzjEm94L05Jng",
+            authDomain: "parqueadero-inteligente-d0b42.firebaseapp.com",
+            databaseURL: "https://parqueadero-inteligente-d0b42-default-rtdb.firebaseio.com",
+            projectId: "parqueadero-inteligente-d0b42",
+            storageBucket: "parqueadero-inteligente-d0b42.firebasestorage.app",
+            messagingSenderId: "460872236309",
+            appId: "1:460872236309:web:1790b0640e464b986e7d1c"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getDatabase(app);
+
+        // =======================================================
+        // LÓGICA DE LA CÁMARA Y TEACHABLE MACHINE
+        // =======================================================
+        const URL_MODELO = "https://teachablemachine.withgoogle.com/models/U30Rg6aXJ/"; // 👈 TU URL AQUÍ
+        
+        let model, webcam, maxPredictions;
+        let placaDetectadaActual = "Desconocido";
+
+        async function iniciarCamara() {
+            try {
+                const modelURL = URL_MODELO + "model.json";
+                const metadataURL = URL_MODELO + "metadata.json";
+                model = await tmImage.load(modelURL, metadataURL);
+                maxPredictions = model.getTotalClasses();
+                
+                const flip = true;
+                webcam = new tmImage.Webcam(400, 300, flip);
+                await webcam.setup();
+                await webcam.play();
+                
+                document.getElementById("camara-canvas").replaceWith(webcam.canvas);
+                webcam.canvas.id = "camara-canvas";
+                window.requestAnimationFrame(buclePrediccion);
+            } catch (error) {
+                console.error("❌ Error:", error);
+            }
+        }
+
+        async function buclePrediccion() {
+            webcam.update();
+            await predecirPlaca();
+            window.requestAnimationFrame(buclePrediccion);
+        }
+
+        async function predecirPlaca() {
+            const prediction = await model.predict(webcam.canvas);
+            let mejorPlaca = "Desconocido";
+            let mejorConfianza = 0;
+
+            for (let i = 0; i < maxPredictions; i++) {
+                if (prediction[i].probability > mejorConfianza) {
+                    mejorConfianza = prediction[i].probability;
+                    mejorPlaca = prediction[i].className;
+                }
+            }
+
+            if (mejorConfianza >= 0.70) {
+                placaDetectadaActual = mejorPlaca;
+                document.getElementById("resultado-prediccion").innerHTML = `Placa: <b>${mejorPlaca}</b> (${(mejorConfianza * 100).toFixed(0)}%)`;
+            } else {
+                placaDetectadaActual = "Desconocido";
+                document.getElementById("resultado-prediccion").innerHTML = `Analizando... (Confianza baja)`;
+            }
+        }
+        
+        iniciarCamara();
+
+        // =======================================================
+        // NUEVO: FUNCIÓN ANTI-DOBLES CLICS (COOLDOWN)
+        // =======================================================
+        function desactivarBotonesTemporalmente() {
+            const btnEntrada = document.getElementById('btn-entrada');
+            const btnSalida = document.getElementById('btn-salida');
+            
+            // Desactivar
+            btnEntrada.disabled = true;
+            btnSalida.disabled = true;
+            
+            // Volver a activar después de 3 segundos (3000 milisegundos)
+            setTimeout(() => {
+                btnEntrada.disabled = false;
+                btnSalida.disabled = false;
+            }, 3000);
+        }
+
+        // =======================================================
+        // LÓGICA DE REGISTRO DE ENTRADA
+        // =======================================================
+        document.getElementById('btn-entrada').addEventListener('click', async () => {
+            const placa = placaDetectadaActual;
+            if (placa === "Desconocido") { alert("⚠️ No hay ninguna placa clara."); return; }
+
+            desactivarBotonesTemporalmente(); // Protección
+
+            try {
+                const vehiculoRef = ref(db, 'vehiculos');
+                const snapshotVehiculos = await get(vehiculoRef);
+                const vehiculos = snapshotVehiculos.val();
+                
+                let estaRegistrado = false;
+                Object.keys(vehiculos).forEach(key => {
+                    if (vehiculos[key].placa === placa) estaRegistrado = true;
+                });
+
+                if (!estaRegistrado) {
+                    alert(`❌ Vehículo ${placa} NO registrado. Entrada denegada.`);
+                    const historialRef = ref(db, 'historial');
+                    const nuevoHistorialRef = push(historialRef);
+                    set(nuevoHistorialRef, { placa: placa, registrado: false, espacio: "N/A", horaEntrada: new Date().toLocaleString(), horaSalida: "Denegado" });
+                    return;
+                }
+
+                const parqueaderosRef = ref(db, 'parqueaderos');
+                const snapshotParq = await get(parqueaderosRef);
+                const parqueaderos = snapshotParq.val();
+                
+                let yaAdentro = false;
+                let espacioDisponible = null;
+
+                for (let i = 1; i <= 8; i++) {
+                    const id = `P-00${i}`;
+                    if (parqueaderos[id].vehiculoAsignado === placa) yaAdentro = true;
+                    if (parqueaderos[id].disponible === true && espacioDisponible === null) espacioDisponible = id;
+                }
+
+                if (yaAdentro) { alert(`⚠️ El vehículo ${placa} ya está dentro.`); return; }
+                if (!espacioDisponible) { alert("🚫 PARQUEADERO LLENO."); return; }
+
+                const cajonRef = ref(db, `parqueaderos/${espacioDisponible}`);
+                const horaActual = new Date().toLocaleString();
+                
+                await set(cajonRef, {
+                    nombre: `Parqueadero ${espacioDisponible.split('-')[1]}`,
+                    disponible: false,
+                    vehiculoAsignado: placa,
+                    horaEntrada: horaActual
+                });
+
+                const historialRef = ref(db, 'historial');
+                const nuevoHistorialRef = push(historialRef);
+                await set(nuevoHistorialRef, {
+                    placa: placa, registrado: true, espacio: espacioDisponible, horaEntrada: horaActual, horaSalida: "Aún adentro"
+                });
+
+                alert(`✅ ¡Entrada registrada!\nVehículo: ${placa}\nEspacio: ${espacioDisponible}`);
+            } catch (error) { console.error("Error entrada:", error); }
+        });
+
+        // =======================================================
+        // LÓGICA DE REGISTRO DE SALIDA
+        // =======================================================
+        document.getElementById('btn-salida').addEventListener('click', async () => {
+            const placa = placaDetectadaActual;
+            if (placa === "Desconocido") { alert("⚠️ No hay ninguna placa clara."); return; }
+
+            desactivarBotonesTemporalmente(); // Protección
+
+            try {
+                const parqueaderosRef = ref(db, 'parqueaderos');
+                const snapshotParq = await get(parqueaderosRef);
+                const parqueaderos = snapshotParq.val();
+                
+                let cajonOcupado = null;
+
+                for (let i = 1; i <= 8; i++) {
+                    const id = `P-00${i}`;
+                    if (parqueaderos[id].vehiculoAsignado === placa) {
+                        cajonOcupado = id;
+                        break;
+                    }
+                }
+
+                if (!cajonOcupado) {
+                    alert(`⚠️ El vehículo ${placa} no se encuentra dentro del parqueadero.`);
+                    return;
+                }
+
+                const cajonRef = ref(db, `parqueaderos/${cajonOcupado}`);
+                await set(cajonRef, {
+                    nombre: `Parqueadero ${cajonOcupado.split('-')[1]}`,
+                    disponible: true,
+                    vehiculoAsignado: null,
+                    horaEntrada: null
+                });
+
+                const historialRef = ref(db, 'historial');
+                const snapshotHist = await get(historialRef);
+                const historiales = snapshotHist.val();
+
+                for (const key in historiales) {
+                    if (historiales[key].placa === placa && historiales[key].horaSalida === "Aún adentro") {
+                        const registroRef = ref(db, `historial/${key}`);
+                        await set(registroRef, {
+                            ...historiales[key],
+                            horaSalida: new Date().toLocaleString()
+                        });
+                        break;
+                    }
+                }
+
+                alert(`🚗 ¡Salida registrada!\nVehículo: ${placa}\nEspacio ${cajonOcupado} liberado.`);
+
+            } catch (error) {
+                console.error("Error salida:", error);
+                alert("Hubo un error al registrar la salida.");
+            }
+        });
+
+        // =======================================================
+        // LÓGICA DE PARQUEADEROS EN TIEMPO REAL
+        // =======================================================
+        const cuadricula = document.getElementById('cuadricula');
+        for (let i = 1; i <= 8; i++) {
+            const id = `P-00${i}`;
+            const div = document.createElement('div');
+            div.id = id; div.className = 'cajon';
+            div.innerHTML = `<h3>${id}</h3><p>Disponible</p>`;
+            cuadricula.appendChild(div);
+        }
+
+        const parqueaderosListenRef = ref(db, 'parqueaderos');
+        onValue(parqueaderosListenRef, (snapshot) => {
+            const data = snapshot.val();
+            let disponibles = 0;
+            for (let i = 1; i <= 8; i++) {
+                const id = `P-00${i}`;
+                const cajonDiv = document.getElementById(id);
+                const cajonData = data[id];
+                if (cajonData.disponible) {
+                    disponibles++;
+                    cajonDiv.className = 'cajon';
+                    cajonDiv.innerHTML = `<h3>${id}</h3><p>Disponible</p>`;
+                } else {
+                    cajonDiv.className = 'cajon ocupado';
+                    cajonDiv.innerHTML = `<h3>${id}</h3><p>Ocupado</p><p><b>${cajonData.vehiculoAsignado}</b></p>`;
+                }
+            }
+            document.getElementById('espacios-disponibles').innerText = disponibles;
+        });
+
+        // =======================================================
+        // LÓGICA DEL HISTORIAL
+        // =======================================================
+        const historialListenRef = ref(db, 'historial');
+        onValue(historialListenRef, (snapshot) => {
+            const data = snapshot.val();
+            const cuerpoTabla = document.getElementById('cuerpo-historial');
+            cuerpoTabla.innerHTML = '';
+            if(data) {
+                const registros = Object.values(data).reverse();
+                registros.forEach(registro => {
+                    const fila = document.createElement('tr');
+                    const claseFondo = registro.registrado ? '' : 'no-registrado';
+                    fila.className = claseFondo;
+                    fila.innerHTML = `
+                        <td>${registro.placa}</td>
+                        <td>${registro.registrado ? 'Registrado' : 'No Registrado'}</td>
+                        <td>${registro.espacio}</td>
+                        <td>${registro.horaEntrada}</td>
+                        <td>${registro.horaSalida || 'Aún adentro'}</td>
+                    `;
+                    cuerpoTabla.appendChild(fila);
+                });
+            }
+        });
+
+    </script>
+</body>
+</html>
